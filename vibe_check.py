@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 import time
 import random
+from PIL import Image, ImageDraw, ImageFont
 
 # Initialize MediaPipe
 mp_holistic = mp.solutions.holistic
@@ -23,6 +24,40 @@ except:
     patrick_img = np.zeros((100, 100, 4), dtype=np.uint8)
     patrick_img[:] = (0, 0, 255, 255) # Red square
 
+# --- Pre-render the 🤨 emoji at multiple sizes using Pillow ---
+def render_emoji_images(emoji_char="🤨", sizes=None):
+    """Pre-render an emoji to BGRA numpy arrays at various sizes."""
+    if sizes is None:
+        sizes = list(range(40, 321, 20))  # 40px to 320px in steps of 20
+    emoji_cache = {}
+    for size in sizes:
+        # Create a transparent RGBA image
+        img = Image.new('RGBA', (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        # Use system emoji font or fallback
+        try:
+            font = ImageFont.truetype('/System/Library/Fonts/Apple Color Emoji.ttc', size - 4)
+        except (OSError, IOError):
+            try:
+                font = ImageFont.truetype('/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf', size - 4)
+            except (OSError, IOError):
+                font = ImageFont.load_default()
+        # Draw emoji centered
+        bbox = draw.textbbox((0, 0), emoji_char, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        x = (size - tw) // 2 - bbox[0]
+        y = (size - th) // 2 - bbox[1]
+        draw.text((x, y), emoji_char, font=font, embedded_color=True)
+        # Convert PIL RGBA → numpy BGRA for OpenCV
+        arr = np.array(img)
+        bgra = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
+        emoji_cache[size] = bgra
+    return emoji_cache, sizes
+
+print("Pre-rendering emoji images...")
+emoji_cache, emoji_sizes = render_emoji_images()
+print(f"  Cached {len(emoji_cache)} sizes.")
+
 # --- Logic Variables ---
 # For 6,7 Gesture
 left_hand_y_history = []
@@ -34,6 +69,10 @@ motion_threshold = 0.05 # Sensitivity for "movement"
 tongue_start_time = None
 TONGUE_HOLD_DURATION = 1.0 # Seconds
 MOUTH_OPEN_THRESHOLD = 0.5 # Threshold for mouth open ratio
+
+# For Rock Eyebrow Gesture
+eyebrow_start_time = None
+EYEBROW_RATIO_THRESHOLD = 1.4  # How much higher one brow must be vs the other
 
 # Reaction States
 current_reaction = None
@@ -69,6 +108,37 @@ def calculate_mouth_ratio(landmarks):
     # Distance between lips
     distance = np.sqrt((top.x - bottom.x)**2 + (top.y - bottom.y)**2)
     return distance
+
+def detect_eyebrow_raise(landmarks):
+    """Detect if one eyebrow is raised significantly higher than the other.
+    Returns ('left', ratio), ('right', ratio), or (None, 0).
+    
+    Uses the distance from eyebrow top to eye top on each side.
+    A larger distance means the eyebrow is raised higher.
+    """
+    # Left side: eyebrow landmark 65 (top), eye top landmark 159
+    left_brow = landmarks[65]
+    left_eye  = landmarks[159]
+    left_dist = abs(left_brow.y - left_eye.y)
+    
+    # Right side: eyebrow landmark 295 (top), eye top landmark 386
+    right_brow = landmarks[295]
+    right_eye  = landmarks[386]
+    right_dist = abs(right_brow.y - right_eye.y)
+    
+    # Avoid division by zero
+    if left_dist < 0.001 or right_dist < 0.001:
+        return (None, 0)
+    
+    # Compare ratios — which side has a bigger gap (eyebrow raised higher)?
+    ratio = left_dist / right_dist
+    
+    if ratio > EYEBROW_RATIO_THRESHOLD:
+        return ('left', ratio)
+    elif (1.0 / ratio) > EYEBROW_RATIO_THRESHOLD:
+        return ('right', 1.0 / ratio)
+    else:
+        return (None, 0)
 
 cap = cv2.VideoCapture(0)
 
@@ -125,6 +195,19 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
             else:
                 tongue_start_time = None
 
+        # 3. Detect Rock Eyebrow (One eyebrow raised)
+        if results.face_landmarks:
+            landmarks = results.face_landmarks.landmark
+            raised_side, raise_ratio = detect_eyebrow_raise(landmarks)
+            
+            if raised_side is not None:
+                if eyebrow_start_time is None:
+                    eyebrow_start_time = time.time()
+                current_reaction = "ROCK"
+                reaction_timer = time.time()
+            else:
+                eyebrow_start_time = None
+
         # --- Render Reactions ---
         
         # Reaction: 6, 7
@@ -155,6 +238,32 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
             else:
                 current_reaction = None
                 patrick_x_pos = 0 # Reset
+
+        # Reaction: Rock Eyebrow 🤨
+        elif current_reaction == "ROCK":
+            if time.time() - reaction_timer < 1.5:  # Persist briefly after release
+                # Calculate how long eyebrow has been raised
+                if eyebrow_start_time is not None:
+                    hold_duration = time.time() - eyebrow_start_time
+                else:
+                    hold_duration = 0
+                
+                # Grow emoji from 40px to 320px over ~3 seconds
+                t = min(hold_duration / 3.0, 1.0)  # Normalized 0→1
+                target_size = int(40 + t * (320 - 40))
+                
+                # Snap to nearest cached size
+                nearest_size = min(emoji_sizes, key=lambda s: abs(s - target_size))
+                emoji_img = emoji_cache[nearest_size]
+                
+                # Position on face (nose tip landmark 1)
+                if results.face_landmarks:
+                    nose = results.face_landmarks.landmark[1]
+                    cx = int(nose.x * w) - nearest_size // 2
+                    cy = int(nose.y * h) - nearest_size // 2
+                    overlay_image_alpha(image, emoji_img, cx, cy)
+            else:
+                current_reaction = None
 
         cv2.imshow('Vibe Check Engine', image)
 
