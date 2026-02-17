@@ -14,15 +14,18 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Load your Patrick Image (Ensure 'patrick.png' is in the folder)
 # We handle the image loading safely
 try:
-    patrick_img = cv2.imread('patrick.png', -1) # -1 to keep alpha channel (transparency)
+    patrick_img = cv2.imread('patrick.jpg', -1) # -1 to keep alpha channel (transparency)
     if patrick_img is None:
         raise FileNotFoundError
     # Resize patrick to be a reasonable size (e.g., 200px wide)
     h, w = patrick_img.shape[:2]
     scale = 200 / w
     patrick_img = cv2.resize(patrick_img, (200, int(h * scale)))
+    # Ensure 4 channels (BGRA) — JPGs only have 3 (BGR)
+    if patrick_img.shape[2] == 3:
+        patrick_img = cv2.cvtColor(patrick_img, cv2.COLOR_BGR2BGRA)
 except:
-    print("Warning: 'patrick.png' not found. Creating a placeholder.")
+    print("Warning: 'patrick.jpg' not found. Creating a placeholder.")
     patrick_img = np.zeros((100, 100, 4), dtype=np.uint8)
     patrick_img[:] = (0, 0, 255, 255) # Red square
 
@@ -77,7 +80,7 @@ calibration_samples_left = []
 calibration_samples_right = []
 baseline_left = None   # Neutral left brow-to-eye distance (normalized)
 baseline_right = None  # Neutral right brow-to-eye distance (normalized)
-EYEBROW_RAISE_SENSITIVITY = 1.4  # How much above baseline counts as "raised" (1.4 = 40% higher)
+EYEBROW_ASYMMETRY_THRESHOLD = 1.2  # Ratio between L and R to trigger (1.2 = 20% difference)
 
 # Reaction States
 current_reaction = None
@@ -149,7 +152,11 @@ def get_brow_distances(landmarks):
     return (left_dist, right_dist)
 
 def detect_eyebrow_raise(left_dist, right_dist, baseline_l, baseline_r):
-    """Detect if one eyebrow is raised relative to calibrated baseline.
+    """Detect if one eyebrow is raised relative to the other.
+    
+    Uses ASYMMETRY between the two sides as the signal — The Rock's
+    signature look has one brow up and the other squinting down.
+    With L:1.12 R:0.82, the asymmetry ratio is 1.12/0.82 = 1.37.
     
     Returns ('left', ratio), ('right', ratio), or (None, 0).
     """
@@ -160,19 +167,21 @@ def detect_eyebrow_raise(left_dist, right_dist, baseline_l, baseline_r):
     left_ratio = left_dist / baseline_l if baseline_l > 0.001 else 1.0
     right_ratio = right_dist / baseline_r if baseline_r > 0.001 else 1.0
     
-    # One eyebrow must be raised AND the other should be near baseline
-    left_raised = left_ratio > EYEBROW_RAISE_SENSITIVITY
-    right_raised = right_ratio > EYEBROW_RAISE_SENSITIVITY
-    
-    if left_raised and not right_raised:
-        return ('left', left_ratio)
-    elif right_raised and not left_raised:
-        return ('right', right_ratio)
-    elif left_raised and right_raised:
-        # Both raised — still counts (like The Rock tilting head)
-        return ('both', max(left_ratio, right_ratio))
-    else:
+    # Avoid division by zero
+    if left_ratio < 0.01 or right_ratio < 0.01:
         return (None, 0)
+    
+    # Asymmetry: compare the two sides against each other
+    if left_ratio > right_ratio:
+        asymmetry = left_ratio / right_ratio
+        if asymmetry > EYEBROW_ASYMMETRY_THRESHOLD:
+            return ('left', asymmetry)
+    else:
+        asymmetry = right_ratio / left_ratio
+        if asymmetry > EYEBROW_ASYMMETRY_THRESHOLD:
+            return ('right', asymmetry)
+    
+    return (None, 0)
 
 cap = cv2.VideoCapture(0)
 
@@ -262,6 +271,8 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
                         reaction_timer = time.time()
                     else:
                         eyebrow_start_time = None
+                        if current_reaction == "ROCK":
+                            current_reaction = None  # Disappear immediately
                     
                     # Debug: show brow ratios
                     l_ratio = left_dist / baseline_left if baseline_left and baseline_left > 0.001 else 0
@@ -285,25 +296,53 @@ with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=
             else:
                 current_reaction = None
 
-        # Reaction: Patrick
+        # Reaction: Patrick — shakes on face in 3D
         elif current_reaction == "PATRICK":
             if time.time() - reaction_timer < 4.0: # Show for 4 seconds
-                # Move Patrick
-                patrick_x_pos += 15 * patrick_direction
+                elapsed = time.time() - reaction_timer
                 
-                # Bounce off edges
-                if patrick_x_pos > w - 100 or patrick_x_pos < 0:
-                    patrick_direction *= -1
+                # Sinusoidal horizontal shake (gets faster over time)
+                shake_freq = 8 + elapsed * 4  # Hz, speeds up
+                shake_amp = 30 + elapsed * 10  # pixels, grows
+                shake_offset = int(shake_amp * np.sin(elapsed * shake_freq))
                 
-                # Overlay Patrick
-                overlay_image_alpha(image, patrick_img, patrick_x_pos, h - 250)
+                # Get face position from nose landmark
+                face_x, face_y = w // 2, h // 2  # fallback
+                if results.face_landmarks:
+                    nose = results.face_landmarks.landmark[1]
+                    face_x = int(nose.x * w)
+                    face_y = int(nose.y * h)
+                
+                # Create a perspective-warped Patrick for 3D shake effect
+                ph, pw = patrick_img.shape[:2]
+                # Shear factor based on shake position for 3D rotation feel
+                shear = shake_offset / (w * 0.5)  # normalized shear
+                
+                # Perspective warp: simulate rotation around vertical axis
+                src_pts = np.float32([[0, 0], [pw, 0], [pw, ph], [0, ph]])
+                # Shift top and bottom edges in opposite directions for perspective
+                skew = int(abs(shear) * ph * 0.3)
+                if shear > 0:
+                    dst_pts = np.float32([[skew, 0], [pw, skew], [pw, ph - skew], [skew, ph]])
+                else:
+                    dst_pts = np.float32([[0, skew], [pw - skew, 0], [pw - skew, ph], [0, ph - skew]])
+                
+                M = cv2.getPerspectiveTransform(src_pts, dst_pts)
+                warped = cv2.warpPerspective(patrick_img, M, (pw, ph), 
+                                            flags=cv2.INTER_LINEAR,
+                                            borderMode=cv2.BORDER_CONSTANT, 
+                                            borderValue=(0, 0, 0, 0))
+                
+                # Position on face with shake offset
+                px = face_x - pw // 2 + shake_offset
+                py = face_y - ph // 2
+                overlay_image_alpha(image, warped, px, py)
             else:
                 current_reaction = None
-                patrick_x_pos = 0 # Reset
 
-        # Reaction: Rock Eyebrow — growing Rock meme
+        # Reaction: Rock Eyebrow — growing Rock meme (disappears when brows return to neutral)
         elif current_reaction == "ROCK":
-            if time.time() - reaction_timer < 2.0:  # Persist 2s after release
+            if eyebrow_start_time is not None:  # Only show while actively raising brow
                 # Calculate how long eyebrow has been raised
                 if eyebrow_start_time is not None:
                     hold_duration = time.time() - eyebrow_start_time
